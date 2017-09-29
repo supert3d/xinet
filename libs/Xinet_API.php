@@ -6,6 +6,8 @@ class Xinet_API {
 	public $isAuth = false; 
 	public $server = NULL;  
 	public $request; // (mixed) Request object. // NOT USED
+	public $requests = array(); // (array) stack of XiNET requests made on pageload. Useful for debug/performance.  
+	
 	public $httpCode; // HTTP status code from request. 
 	
 	public $cacheThumbs = true; 
@@ -104,6 +106,7 @@ class Xinet_API {
 
 	public function __construct($server){
 		$this->server = $server; 
+		$this->requests = array(); 
 		
 		try {
 			if(!extension_loaded('openssl')){
@@ -178,6 +181,7 @@ class Xinet_API {
 		$this->pwd = NULL; 
 		unset($_SESSION['userData']); 
 		unset($_SESSION['kywdData']); 
+		session_destroy();
 	}
 	
 	public function getVideo($fileID){
@@ -311,12 +315,14 @@ class Xinet_API {
 		$fileData = $this->request('fileinfo',array(
 			'fileid' => $fileID
 		),'array');
+		 
 		$fileData = $fileData['FILES_INFO'][0]; // ['PARENT_FILE_ID']
-		
 		$this->request('streamfile',array(
 			'path' => urldecode($fileData['FILE_PATH']),
 			'attach' => 'true',
-			'_filelength' => $fileData['FILE_LENGTH'] // Not a valid query param, need to unset on request
+			// Custom query param, need to unset on request as not valid endpoint params. 
+			'_filelength' => $fileData['FILE_LENGTH'], 
+			'_filetype' => $fileData['FILE_TYPE']
 		));
 			
 	}
@@ -364,8 +370,9 @@ class Xinet_API {
 		
 		if($action=='streamfile' && isset($args['_filelength'])){
 			$fileSize = $args['_filelength'];
-			// Remove artificially injected argument. 
-			unset($args['_filelength']); 
+			$fileType = $args['_filetype'];
+			// Remove custom injected properties. 
+			unset($args['_filelength'],$args['_filetype']); 
 		}
 		
 		$args = array_filter($args)+array('action'=>$action);
@@ -374,12 +381,8 @@ class Xinet_API {
 		$this->request .= http_build_query($args);
 		$curl = curl_init();
 		
-		/*
-		if($action == 'submitkywd'){
-			echo $this->request;
-			//exit();  	
-		}
-		*/
+		
+		$this->requests[] = $this->request; 
 		
 		
 		$options = array(
@@ -388,31 +391,48 @@ class Xinet_API {
 			CURLOPT_RETURNTRANSFER => true,
 			CURLOPT_SSL_VERIFYPEER => false,
 			CURLOPT_SSL_VERIFYHOST => false,
-			CURLOPT_ENCODING => 'gzip,deflate', 
 			CURLOPT_HTTPAUTH => CURLAUTH_BASIC, //CURLAUTH_ANY,
-			CURLOPT_USERPWD => $this->uid.":".$this->pwd
+			CURLOPT_USERPWD => $this->uid.":".$this->pwd,
+			CURLOPT_TIMEOUT => 300, // 5 mins
+			CURLOPT_BINARYTRANSFER => (($action=='streamfile' && $args['attach'] == 'true') ? true : false) 
 		);
-			
+
+		if($action!='streamfile'){
+			$options[CURLOPT_ENCODING] = 'gzip,deflate';
+		}
+		
 		curl_setopt_array($curl,$options);
 		
 		// Custom for streamfile only if attach(ment) == true; 
 		if($action=='streamfile' && $args['attach'] == 'true'){
-			
-			header('Content-Type: application/octet-stream');	
-			header('Content-Disposition: attachment; filename="'.basename($args['path']));	
-			header('Content-Length: '.$fileSize);
-			header('Content-Transfer-Encoding: binary');
+			ob_end_clean(); 
+			switch(strtolower($fileType)){
+				case '8bps': 
+					header('Content-Type: image/vnd.adobe.photoshop');
+				break;
+				case 'tiff': 
+					header('Content-Type: image/tiff');
+				break; 
+				case 'pdf':
+					header('Content-Type: application/pdf');
+				break;
+				default: 
+					header('Content-Type: application/octet-stream');
+				break; 
+			}
+			header('Content-Transfer-Encoding: binary',true);
+			header('Content-Disposition: attachment; filename="'.basename($args['path']).'"');	
+			// NOTE: $fileSize is mis-reported by XiNET!!! DO NOT USE. 
+			// header('Content-Length: '.$fileSize);
 			header('Content-Description: File Transfer');
-			
-			
 			curl_setopt($curl, CURLOPT_WRITEFUNCTION, function($handle, $data) {
-				echo $data;
+				echo $data; // Dump data
 				return strlen($data);
-				exit(); 
-			});
-			
+			});	
+			curl_exec($curl);
+			exit(); 
 		}
-
+		
 		$response = curl_exec($curl);
 		$statusCode = curl_getinfo($curl,CURLINFO_HTTP_CODE);
 		$this->httpCode = $statusCode; 
